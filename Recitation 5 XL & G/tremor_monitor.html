@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>IMU Tremor Monitor</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+      margin: 0;
+      padding: 0;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 24px;
+      margin-bottom: 12px;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    button {
+      padding: 8px 16px;
+      border-radius: 999px;
+      border: none;
+      cursor: pointer;
+      background: #22c55e;
+      color: #022c22;
+      font-weight: 600;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .status {
+      font-size: 14px;
+      opacity: 0.9;
+    }
+    .cards {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .card {
+      flex: 1 1 160px;
+      background: #020617;
+      border-radius: 12px;
+      padding: 10px 12px;
+      box-shadow: 0 10px 25px rgba(15,23,42,0.75);
+      border: 1px solid #1f2937;
+    }
+    .card-title {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #9ca3af;
+      margin-bottom: 4px;
+    }
+    .card-value {
+      font-size: 20px;
+      font-weight: 600;
+    }
+    .card-unit {
+      font-size: 12px;
+      color: #6b7280;
+      margin-left: 4px;
+    }
+    .state-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      margin-left: 6px;
+    }
+    .state-0 { background: #1f2937; color: #9ca3af; }
+    .state-1 { background: #f97316; color: #111827; }
+    .state-2 { background: #facc15; color: #111827; }
+
+    .charts {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    @media (min-width: 900px) {
+      .charts {
+        grid-template-columns: 1fr 1fr;
+      }
+      .charts > .full-width {
+        grid-column: 1 / -1;
+      }
+    }
+
+    canvas {
+      background: #020617;
+      border-radius: 12px;
+      padding: 8px;
+      box-shadow: 0 10px 25px rgba(15,23,42,0.75);
+      border: 1px solid #1f2937;
+    }
+
+    .warning {
+      font-size: 14px;
+      color: #f97316;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Parkinson&#39;s Tremor Monitor (Web Serial)</h1>
+
+    <div class="toolbar">
+      <button id="connectBtn">Connect Serial</button>
+      <div class="status">
+        Status: <span id="statusText">Not connected</span>
+      </div>
+    </div>
+
+    <div id="warning" class="warning" style="display:none;">
+      Your browser does not support Web Serial API. Please use Chrome / Edge (Desktop) and open this page via
+      <code>http://localhost</code> or <code>https://</code>.
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-title">Frequency</div>
+        <div class="card-value">
+          <span id="freqVal">0.00</span>
+          <span class="card-unit">Hz</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">RMS Acc</div>
+        <div class="card-value">
+          <span id="rmsVal">0.0000</span>
+          <span class="card-unit">g</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">State</div>
+        <div class="card-value">
+          <span id="stateVal">0</span>
+          <span id="stateBadge" class="state-badge state-0">Normal / Other</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="charts">
+      <div class="full-width">
+        <canvas id="freqChart"></canvas>
+      </div>
+      <div>
+        <canvas id="rmsChart"></canvas>
+      </div>
+      <div>
+        <canvas id="stateChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // === 基本 DOM 元素 ===
+    const connectBtn = document.getElementById("connectBtn");
+    const statusText = document.getElementById("statusText");
+    const warningEl = document.getElementById("warning");
+
+    const freqValEl = document.getElementById("freqVal");
+    const rmsValEl = document.getElementById("rmsVal");
+    const stateValEl = document.getElementById("stateVal");
+    const stateBadgeEl = document.getElementById("stateBadge");
+
+    // 检查浏览器是否支持 Web Serial
+    if (!("serial" in navigator)) {
+      warningEl.style.display = "block";
+      connectBtn.disabled = true;
+    }
+
+    // === 数据缓存 ===
+    const timeData = [];   // x 轴：窗口序号 * 3 秒
+    const freqData = [];
+    const rmsData = [];
+    const stateData = [];
+
+    let sampleIndex = 0;   // 第几个 3 秒窗口
+    let lastRms = 0.0;
+    let lastState = 0;
+
+    const MAX_POINTS = 200; // 最多保留多少个点，避免图太长
+
+    // === Chart.js 配置 ===
+    const freqCtx = document.getElementById("freqChart").getContext("2d");
+    const rmsCtx = document.getElementById("rmsChart").getContext("2d");
+    const stateCtx = document.getElementById("stateChart").getContext("2d");
+
+    const freqChart = new Chart(freqCtx, {
+      type: "line",
+      data: {
+        labels: timeData,
+        datasets: [{
+          label: "Frequency (Hz)",
+          data: freqData,
+          borderWidth: 2,
+          tension: 0.1,
+          fill: false
+        }]
+      },
+      options: {
+        responsive: true,
+        animation: false,
+        scales: {
+          x: {
+            title: { display: true, text: "Time (s)" }
+          },
+          y: {
+            title: { display: true, text: "Hz" },
+            suggestedMin: 0,
+            suggestedMax: 10
+          }
+        }
+      }
+    });
+
+    const rmsChart = new Chart(rmsCtx, {
+      type: "line",
+      data: {
+        labels: timeData,
+        datasets: [{
+          label: "RMS (g)",
+          data: rmsData,
+          borderWidth: 2,
+          tension: 0.1,
+          fill: false
+        }]
+      },
+      options: {
+        responsive: true,
+        animation: false,
+        scales: {
+          x: {
+            title: { display: true, text: "Time (s)" }
+          },
+          y: {
+            title: { display: true, text: "g" }
+          }
+        }
+      }
+    });
+
+    const stateChart = new Chart(stateCtx, {
+      type: "line",
+      data: {
+        labels: timeData,
+        datasets: [{
+          label: "State (0=Normal,1=Tremor,2=Dyskinesia)",
+          data: stateData,
+          borderWidth: 2,
+          stepped: true,
+          fill: false
+        }]
+      },
+      options: {
+        responsive: true,
+        animation: false,
+        scales: {
+          x: {
+            title: { display: true, text: "Time (s)" }
+          },
+          y: {
+            title: { display: true, text: "State" },
+            ticks: {
+              stepSize: 1,
+              callback: (v) => v
+            },
+            suggestedMin: -0.5,
+            suggestedMax: 2.5
+          }
+        }
+      }
+    });
+
+    function updateCharts() {
+      freqChart.update("none");
+      rmsChart.update("none");
+      stateChart.update("none");
+    }
+
+    function pushSample(time, freq, rms, state) {
+      timeData.push(time);
+      freqData.push(freq);
+      rmsData.push(rms);
+      stateData.push(state);
+
+      // 控制长度
+      if (timeData.length > MAX_POINTS) {
+        timeData.shift();
+        freqData.shift();
+        rmsData.shift();
+        stateData.shift();
+      }
+
+      updateCharts();
+    }
+
+    function updateStateBadge(state) {
+      stateBadgeEl.className = "state-badge";
+      if (state === 1) {
+        stateBadgeEl.classList.add("state-1");
+        stateBadgeEl.textContent = "Tremor";
+      } else if (state === 2) {
+        stateBadgeEl.classList.add("state-2");
+        stateBadgeEl.textContent = "Dyskinesia";
+      } else {
+        stateBadgeEl.classList.add("state-0");
+        stateBadgeEl.textContent = "Normal / Other";
+      }
+    }
+
+    // 解析每一行 ">name:value"
+    function handleLine(rawLine) {
+      const line = rawLine.trim();
+      if (!line.startsWith(">")) return;
+
+      const body = line.slice(1);
+      const parts = body.split(":");
+      if (parts.length !== 2) return;
+
+      const name = parts[0].trim();
+      const value = parseFloat(parts[1]);
+
+      if (Number.isNaN(value)) return;
+
+      if (name === "rms") {
+        lastRms = value;
+        rmsValEl.textContent = value.toFixed(4);
+      } else if (name === "state") {
+        lastState = value;
+        stateValEl.textContent = value.toFixed(0);
+        updateStateBadge(lastState);
+      } else if (name === "freq") {
+        // 每收到一次 freq，就认为是一个 3 秒窗口的结果
+        const timeSec = sampleIndex * 3.0; // 你现在每 3 秒分析一次
+        sampleIndex += 1;
+
+        freqValEl.textContent = value.toFixed(2);
+
+        // 如果还没收到 rms/state，就用上一次的值
+        pushSample(timeSec, value, lastRms, lastState);
+      }
+    }
+
+    async function connectSerial() {
+      try {
+        statusText.textContent = "Requesting port...";
+        const port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+
+        statusText.textContent = "Connected";
+        connectBtn.disabled = true;
+
+        const textDecoder = new TextDecoderStream();
+        const readableClosed = port.readable.pipeTo(textDecoder.writable);
+        const reader = textDecoder.readable.getReader();
+
+        let buffer = "";
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            console.log("[Serial] Done");
+            break;
+          }
+          if (value) {
+            buffer += value;
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop();
+            for (const line of lines) {
+              handleLine(line);
+            }
+          }
+        }
+
+        reader.releaseLock();
+        await readableClosed.catch(() => {});
+        await port.close();
+        statusText.textContent = "Disconnected";
+        connectBtn.disabled = false;
+      } catch (err) {
+        console.error(err);
+        statusText.textContent = "Error: " + err;
+      }
+    }
+
+    connectBtn.addEventListener("click", () => {
+      if (!("serial" in navigator)) {
+        alert("Web Serial API not supported in this browser.");
+        return;
+      }
+      connectSerial();
+    });
+  </script>
+</body>
+</html>
