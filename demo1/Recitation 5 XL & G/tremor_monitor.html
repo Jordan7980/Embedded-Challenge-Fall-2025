@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>IMU Tremor Monitor (BLE)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+      margin: 0;
+      padding: 0;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 24px;
+      margin-bottom: 12px;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 8px 16px;
+      border-radius: 999px;
+      border: none;
+      cursor: pointer;
+      background: #22c55e;
+      color: #022c22;
+      font-weight: 600;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .status {
+      font-size: 14px;
+      opacity: 0.9;
+    }
+    .cards {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .card {
+      flex: 1 1 160px;
+      background: #020617;
+      border-radius: 12px;
+      padding: 10px 12px;
+      box-shadow: 0 10px 25px rgba(15,23,42,0.75);
+      border: 1px solid #1f2937;
+    }
+    .card-title {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #9ca3af;
+      margin-bottom: 4px;
+    }
+    .card-value {
+      font-size: 20px;
+      font-weight: 600;
+    }
+    .card-unit {
+      font-size: 12px;
+      color: #6b7280;
+      margin-left: 4px;
+    }
+    .state-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      margin-left: 6px;
+    }
+    .state-0 { background: #1f2937; color: #9ca3af; }
+    .state-1 { background: #f97316; color: #111827; }
+    .state-2 { background: #facc15; color: #111827; }
+
+    .charts {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    @media (min-width: 900px) {
+      .charts {
+        grid-template-columns: 1fr 1fr;
+      }
+      .charts > .full-width {
+        grid-column: 1 / -1;
+      }
+    }
+
+    canvas {
+      background: #020617;
+      border-radius: 12px;
+      padding: 8px;
+      box-shadow: 0 10px 25px rgba(15,23,42,0.75);
+      border: 1px solid #1f2937;
+    }
+
+    .warning {
+      font-size: 14px;
+      color: #f97316;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Parkinson&#39;s Tremor Monitor (Web Bluetooth)</h1>
+
+    <div class="toolbar">
+      <button id="connectBtn">Connect BLE</button>
+      <button id="startSegBtn">Start Segment</button>
+      <button id="endSegBtn" disabled>End Segment</button>
+      <div class="status">
+        Status: <span id="statusText">Not connected</span>
+      </div>
+    </div>
+
+    <div id="warning" class="warning" style="display:none;">
+      Your browser does not support Web Bluetooth. Please use Chrome / Edge (Desktop) and open this page via
+      <code>http://localhost</code> or <code>https://</code>.
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-title">Frequency</div>
+        <div class="card-value">
+          <span id="freqVal">0.00</span>
+          <span class="card-unit">Hz</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">RMS Acc</div>
+        <div class="card-value">
+          <span id="rmsVal">0.0000</span>
+          <span class="card-unit">g</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">State</div>
+        <div class="card-value">
+          <span id="stateVal">0</span>
+          <span id="stateBadge" class="state-badge state-0">Normal / Other</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- AI 诊断结果卡片 -->
+    <div class="card" style="margin-bottom:16px;">
+      <div class="card-title">AI Diagnosis</div>
+      <div class="card-value" style="font-size:14px; line-height:1.4; white-space:pre-wrap;" id="aiOutput">
+        (no analysis yet)
+      </div>
+    </div>
+
+    <div class="charts">
+      <div class="full-width">
+        <canvas id="freqChart"></canvas>
+      </div>
+      <div>
+        <canvas id="rmsChart"></canvas>
+      </div>
+      <div>
+        <canvas id="stateChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // === 基本 DOM 元素 ===
+    const connectBtn = document.getElementById("connectBtn");
+    const startSegBtn = document.getElementById("startSegBtn");
+    const endSegBtn = document.getElementById("endSegBtn");
+    const statusText = document.getElementById("statusText");
+    const warningEl = document.getElementById("warning");
+
+    const freqValEl = document.getElementById("freqVal");
+    const rmsValEl = document.getElementById("rmsVal");
+    const stateValEl = document.getElementById("stateVal");
+    const stateBadgeEl = document.getElementById("stateBadge");
+    const aiOutputEl = document.getElementById("aiOutput");
+
+    // === Web Bluetooth 支持检测 ===
+    if (!("bluetooth" in navigator)) {
+      warningEl.style.display = "block";
+      connectBtn.disabled = true;
+      startSegBtn.disabled = true;
+      endSegBtn.disabled = true;
+    }
+
+    // === 数据缓存 ===
+    const timeData = [];   // x 轴：窗口序号 * 3 秒
+    const freqData = [];
+    const rmsData = [];
+    const stateData = [];
+
+    let sampleIndex = 0;   // 第几个 3 秒窗口
+    let lastRms = 0.0;
+    let lastState = 0;
+
+    const MAX_POINTS = 200; // 最多保留多少个点，避免图太长
+
+    // 记录片段相关
+    let isRecordingSegment = false;
+    let currentSegment = []; // {time_sec, freq_hz, rms_g, state_code}
+
+    // === Chart.js 配置 ===
+    const freqCtx = document.getElementById("freqChart").getContext("2d");
+    const rmsCtx = document.getElementById("rmsChart").getContext("2d");
+    const stateCtx = document.getElementById("stateChart").getContext("2d");
+
+    const freqChart = new Chart(freqCtx, {
+      type: "line",
+      data: {
+        labels: timeData,
+        datasets: [{
+          label: "Frequency (Hz)",
+          data: freqData,
+          borderWidth: 2,
+          tension: 0.1,
+          fill: false
+        }]
+      },
+      options: {
+        responsive: true,
+        animation: false,
+        scales: {
+          x: {
+            title: { display: true, text: "Time (s)" }
+          },
+          y: {
+            title: { display: true, text: "Hz" },
+            suggestedMin: 0,
+            suggestedMax: 10
+          }
+        }
+      }
+    });
+
+    const rmsChart = new Chart(rmsCtx, {
+      type: "line",
+      data: {
+        labels: timeData,
+        datasets: [{
+          label: "RMS (g)",
+          data: rmsData,
+          borderWidth: 2,
+          tension: 0.1,
+          fill: false
+        }]
+      },
+      options: {
+        responsive: true,
+        animation: false,
+        scales: {
+          x: {
+            title: { display: true, text: "Time (s)" }
+          },
+          y: {
+            title: { display: true, text: "g" }
+          }
+        }
+      }
+    });
+
+    const stateChart = new Chart(stateCtx, {
+      type: "line",
+      data: {
+        labels: timeData,
+        datasets: [{
+          label: "State (0=Normal,1=Tremor,2=Dyskinesia)",
+          data: stateData,
+          borderWidth: 2,
+          stepped: true,
+          fill: false
+        }]
+      },
+      options: {
+        responsive: true,
+        animation: false,
+        scales: {
+          x: {
+            title: { display: true, text: "Time (s)" }
+          },
+          y: {
+            title: { display: true, text: "State" },
+            ticks: {
+              stepSize: 1,
+              callback: (v) => v
+            },
+            suggestedMin: -0.5,
+            suggestedMax: 2.5
+          }
+        }
+      }
+    });
+
+    function updateCharts() {
+      freqChart.update("none");
+      rmsChart.update("none");
+      stateChart.update("none");
+    }
+
+    function pushSample(time, freq, rms, state) {
+      timeData.push(time);
+      freqData.push(freq);
+      rmsData.push(rms);
+      stateData.push(state);
+
+      // 控制长度
+      if (timeData.length > MAX_POINTS) {
+        timeData.shift();
+        freqData.shift();
+        rmsData.shift();
+        stateData.shift();
+      }
+
+      updateCharts();
+    }
+
+    function updateStateBadge(state) {
+      stateBadgeEl.className = "state-badge";
+      if (state === 1) {
+        stateBadgeEl.classList.add("state-1");
+        stateBadgeEl.textContent = "Tremor";
+      } else if (state === 2) {
+        stateBadgeEl.classList.add("state-2");
+        stateBadgeEl.textContent = "Dyskinesia";
+      } else {
+        stateBadgeEl.classList.add("state-0");
+        stateBadgeEl.textContent = "Normal / Other";
+      }
+    }
+
+    // 解析每一行 ">name:value"
+    function handleLine(rawLine) {
+      const line = rawLine.trim();
+      if (!line.startsWith(">")) return;
+
+      const body = line.slice(1);
+      const parts = body.split(":");
+      if (parts.length !== 2) return;
+
+      const name = parts[0].trim();
+      const value = parseFloat(parts[1]);
+
+      if (Number.isNaN(value)) return;
+
+      if (name === "rms") {
+        lastRms = value;
+        rmsValEl.textContent = value.toFixed(4);
+      } else if (name === "state") {
+        lastState = value;
+        stateValEl.textContent = value.toFixed(0);
+        updateStateBadge(lastState);
+      } else if (name === "freq") {
+        // 每收到一次 freq，就认为是一个 3 秒窗口的结果
+        const timeSec = sampleIndex * 3.0; // 你现在每 3 秒分析一次
+        sampleIndex += 1;
+
+        freqValEl.textContent = value.toFixed(2);
+
+        // 画图
+        pushSample(timeSec, value, lastRms, lastState);
+
+        // 如果正在记录一个片段，就把这次窗口的数据存起来
+        if (isRecordingSegment) {
+          currentSegment.push({
+            time_sec: timeSec,
+            freq_hz: value,
+            rms_g: lastRms,
+            state_code: lastState
+          });
+        }
+      }
+    }
+
+    // 调用本地 LLM（通过 LM Studio）分析一个片段
+    async function analyzeSegmentWithLLM(segment) {
+      const n = segment.length;
+      let sumFreq = 0, sumRms = 0;
+      let cntState = {0: 0, 1: 0, 2: 0};
+
+      for (const s of segment) {
+        sumFreq += s.freq_hz;
+        sumRms += s.rms_g;
+        if (s.state_code in cntState) {
+          cntState[s.state_code]++;
+        }
+      }
+
+      const avgFreq = sumFreq / n;
+      const avgRms = sumRms / n;
+      const dominantState = Number(
+        Object.entries(cntState).sort((a, b) => b[1] - a[1])[0][0]
+      );
+
+      const summary = {
+        num_windows: n,
+        avg_freq_hz: avgFreq,
+        avg_rms_g: avgRms,
+        state_counts: cntState,
+        dominant_state: dominantState,
+        windows: segment
+      };
+
+      const userPrompt = `
+You are a medical assistant helping analyze Parkinson's disease movement data.
+
+The device collects 3-second windows of IMU data and computes:
+- freq_hz: dominant tremor frequency for each window
+- rms_g: RMS acceleration amplitude (in g)
+- state_code: 0 = normal/other, 1 = tremor (3-5 Hz), 2 = dyskinesia (5-7 Hz)
+
+Here is one recording segment in JSON:
+${JSON.stringify(summary, null, 2)}
+
+Please:
+1. Provide a concise but detailed summary of the movement pattern across this segment (3-6 sentences).
+2. Comment on whether the pattern is more consistent with resting tremor, dyskinesia, or mostly normal movement, and explain your reasoning in terms of frequency bands and amplitude levels.
+3. Explicitly state that this is not a medical diagnosis and that the interpretation must be confirmed by a clinician.
+
+Use precise, professional language but keep it understandable to a non-expert.
+`;
+
+      const payload = {
+        model: "llama-3.2-3b-instruct",
+        messages: [
+          {
+            role: "system",
+            content: "You are a careful assistant describing patterns in IMU-based movement data. You must not provide medical diagnoses or treatment recommendations."
+          },
+          { role: "user", content: userPrompt }
+        ],
+        temperature: 0.2,
+        max_tokens: 512
+      };
+
+      // 不带 Authorization，Content-Type 用 text/plain 降低 CORS 预检风险
+      const response = await fetch("http://127.0.0.1:1234/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain"
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error("HTTP " + response.status + ": " + text);
+      }
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content ?? "(no content)";
+      return content.trim();
+    }
+
+    // =======================
+    //    Web Bluetooth 部分
+    // =======================
+
+    // 与 MCU 中保持一致的 UUID
+    const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+    const UART_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+    let bleDevice = null;
+    let bleCharacteristic = null;
+    let bleBuffer = "";
+    const btTextDecoder = new TextDecoder();
+
+    connectBtn.addEventListener("click", () => {
+      if (!navigator.bluetooth) {
+        alert("This browser does not support Web Bluetooth. Please use Chrome / Edge on desktop.");
+        return;
+      }
+      if (!bleDevice) {
+        connectBLE();
+      } else {
+        disconnectBLE();
+      }
+    });
+
+    async function connectBLE() {
+      try {
+        statusText.textContent = "Requesting BLE device...";
+
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: "Tremor-STM32" }], // 和 MCU 广播名一致
+          optionalServices: [UART_SERVICE_UUID]
+        });
+
+        bleDevice = device;
+        bleDevice.addEventListener("gattserverdisconnected", onDisconnected);
+
+        statusText.textContent = "Connecting GATT...";
+        const server = await bleDevice.gatt.connect();
+
+        const service = await server.getPrimaryService(UART_SERVICE_UUID);
+        const characteristic = await service.getCharacteristic(UART_TX_CHAR_UUID);
+
+        bleCharacteristic = characteristic;
+
+        await bleCharacteristic.startNotifications();
+        bleCharacteristic.addEventListener(
+          "characteristicvaluechanged",
+          handleNotification
+        );
+
+        statusText.textContent = "BLE Connected";
+        connectBtn.textContent = "Disconnect BLE";
+      } catch (err) {
+        console.error(err);
+        statusText.textContent = "BLE Error: " + err;
+        bleDevice = null;
+        bleCharacteristic = null;
+        connectBtn.textContent = "Connect BLE";
+      }
+    }
+
+    function disconnectBLE() {
+      if (bleDevice && bleDevice.gatt.connected) {
+        bleDevice.gatt.disconnect();
+      }
+      // onDisconnected 会负责 UI 状态
+    }
+
+    function onDisconnected() {
+      statusText.textContent = "BLE Disconnected";
+      connectBtn.textContent = "Connect BLE";
+      bleDevice = null;
+      bleCharacteristic = null;
+      bleBuffer = "";
+    }
+
+    function handleNotification(event) {
+      const value = event.target.value;
+      const chunk = btTextDecoder.decode(value);
+
+      bleBuffer += chunk;
+      const lines = bleBuffer.split(/\r?\n/);
+      bleBuffer = lines.pop(); // 最后一行可能不完整
+
+      for (const line of lines) {
+        handleLine(line);
+      }
+    }
+
+    // 片段开始 / 结束
+    startSegBtn.addEventListener("click", () => {
+      if (!isRecordingSegment) {
+        isRecordingSegment = true;
+        currentSegment = [];
+        aiOutputEl.textContent = "(recording segment...)";
+        startSegBtn.disabled = true;
+        endSegBtn.disabled = false;
+      }
+    });
+
+    endSegBtn.addEventListener("click", () => {
+      if (isRecordingSegment) {
+        isRecordingSegment = false;
+        startSegBtn.disabled = false;
+        endSegBtn.disabled = true;
+
+        if (currentSegment.length === 0) {
+          aiOutputEl.textContent = "No data recorded in this segment.";
+          return;
+        }
+
+        aiOutputEl.textContent = "Analyzing segment with local LLM...";
+        analyzeSegmentWithLLM(currentSegment)
+          .then(text => {
+            aiOutputEl.textContent = text;
+          })
+          .catch(err => {
+            console.error(err);
+            aiOutputEl.textContent = "Error calling local LLM: " + err.message;
+          });
+      }
+    });
+  </script>
+</body>
+</html>
