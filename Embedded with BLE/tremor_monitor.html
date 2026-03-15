@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>IMU Tremor Monitor</title>
+  <title>IMU Tremor Monitor (BLE)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     body {
@@ -26,6 +26,7 @@
       align-items: center;
       gap: 12px;
       margin-bottom: 16px;
+      flex-wrap: wrap;
     }
     button {
       padding: 8px 16px;
@@ -116,17 +117,19 @@
 </head>
 <body>
   <div class="container">
-    <h1>Parkinson&#39;s Tremor Monitor (Web Serial)</h1>
+    <h1>Parkinson&#39;s Tremor Monitor (Web Bluetooth)</h1>
 
     <div class="toolbar">
-      <button id="connectBtn">Connect Serial</button>
+      <button id="connectBtn">Connect BLE</button>
+      <button id="startSegBtn">Start Segment</button>
+      <button id="endSegBtn" disabled>End Segment</button>
       <div class="status">
         Status: <span id="statusText">Not connected</span>
       </div>
     </div>
 
     <div id="warning" class="warning" style="display:none;">
-      Your browser does not support Web Serial API. Please use Chrome / Edge (Desktop) and open this page via
+      Your browser does not support Web Bluetooth. Please use Chrome / Edge (Desktop) and open this page via
       <code>http://localhost</code> or <code>https://</code>.
     </div>
 
@@ -154,6 +157,14 @@
       </div>
     </div>
 
+    <!-- AI 诊断结果卡片 -->
+    <div class="card" style="margin-bottom:16px;">
+      <div class="card-title">AI Diagnosis</div>
+      <div class="card-value" style="font-size:14px; line-height:1.4; white-space:pre-wrap;" id="aiOutput">
+        (no analysis yet)
+      </div>
+    </div>
+
     <div class="charts">
       <div class="full-width">
         <canvas id="freqChart"></canvas>
@@ -170,6 +181,8 @@
   <script>
     // === 基本 DOM 元素 ===
     const connectBtn = document.getElementById("connectBtn");
+    const startSegBtn = document.getElementById("startSegBtn");
+    const endSegBtn = document.getElementById("endSegBtn");
     const statusText = document.getElementById("statusText");
     const warningEl = document.getElementById("warning");
 
@@ -177,11 +190,14 @@
     const rmsValEl = document.getElementById("rmsVal");
     const stateValEl = document.getElementById("stateVal");
     const stateBadgeEl = document.getElementById("stateBadge");
+    const aiOutputEl = document.getElementById("aiOutput");
 
-    // 检查浏览器是否支持 Web Serial
-    if (!("serial" in navigator)) {
+    // === Web Bluetooth 支持检测 ===
+    if (!("bluetooth" in navigator)) {
       warningEl.style.display = "block";
       connectBtn.disabled = true;
+      startSegBtn.disabled = true;
+      endSegBtn.disabled = true;
     }
 
     // === 数据缓存 ===
@@ -195,6 +211,10 @@
     let lastState = 0;
 
     const MAX_POINTS = 200; // 最多保留多少个点，避免图太长
+
+    // 记录片段相关
+    let isRecordingSegment = false;
+    let currentSegment = []; // {time_sec, freq_hz, rms_g, state_code}
 
     // === Chart.js 配置 ===
     const freqCtx = document.getElementById("freqChart").getContext("2d");
@@ -352,59 +372,223 @@
 
         freqValEl.textContent = value.toFixed(2);
 
-        // 如果还没收到 rms/state，就用上一次的值
+        // 画图
         pushSample(timeSec, value, lastRms, lastState);
-      }
-    }
 
-    async function connectSerial() {
-      try {
-        statusText.textContent = "Requesting port...";
-        const port = await navigator.serial.requestPort();
-        await port.open({ baudRate: 115200 });
-
-        statusText.textContent = "Connected";
-        connectBtn.disabled = true;
-
-        const textDecoder = new TextDecoderStream();
-        const readableClosed = port.readable.pipeTo(textDecoder.writable);
-        const reader = textDecoder.readable.getReader();
-
-        let buffer = "";
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) {
-            console.log("[Serial] Done");
-            break;
-          }
-          if (value) {
-            buffer += value;
-            const lines = buffer.split(/\r?\n/);
-            buffer = lines.pop();
-            for (const line of lines) {
-              handleLine(line);
-            }
-          }
+        // 如果正在记录一个片段，就把这次窗口的数据存起来
+        if (isRecordingSegment) {
+          currentSegment.push({
+            time_sec: timeSec,
+            freq_hz: value,
+            rms_g: lastRms,
+            state_code: lastState
+          });
         }
-
-        reader.releaseLock();
-        await readableClosed.catch(() => {});
-        await port.close();
-        statusText.textContent = "Disconnected";
-        connectBtn.disabled = false;
-      } catch (err) {
-        console.error(err);
-        statusText.textContent = "Error: " + err;
       }
     }
+
+    // 调用本地 LLM（通过 LM Studio）分析一个片段
+    async function analyzeSegmentWithLLM(segment) {
+      const n = segment.length;
+      let sumFreq = 0, sumRms = 0;
+      let cntState = {0: 0, 1: 0, 2: 0};
+
+      for (const s of segment) {
+        sumFreq += s.freq_hz;
+        sumRms += s.rms_g;
+        if (s.state_code in cntState) {
+          cntState[s.state_code]++;
+        }
+      }
+
+      const avgFreq = sumFreq / n;
+      const avgRms = sumRms / n;
+      const dominantState = Number(
+        Object.entries(cntState).sort((a, b) => b[1] - a[1])[0][0]
+      );
+
+      const summary = {
+        num_windows: n,
+        avg_freq_hz: avgFreq,
+        avg_rms_g: avgRms,
+        state_counts: cntState,
+        dominant_state: dominantState,
+        windows: segment
+      };
+
+      const userPrompt = `
+You are a medical assistant helping analyze Parkinson's disease movement data.
+
+The device collects 3-second windows of IMU data and computes:
+- freq_hz: dominant tremor frequency for each window
+- rms_g: RMS acceleration amplitude (in g)
+- state_code: 0 = normal/other, 1 = tremor (3-5 Hz), 2 = dyskinesia (5-7 Hz)
+
+Here is one recording segment in JSON:
+${JSON.stringify(summary, null, 2)}
+
+Please:
+1. Provide a concise but detailed summary of the movement pattern across this segment (3-6 sentences).
+2. Comment on whether the pattern is more consistent with resting tremor, dyskinesia, or mostly normal movement, and explain your reasoning in terms of frequency bands and amplitude levels.
+3. Explicitly state that this is not a medical diagnosis and that the interpretation must be confirmed by a clinician.
+
+Use precise, professional language but keep it understandable to a non-expert.
+`;
+
+      const payload = {
+        model: "llama-3.2-3b-instruct",
+        messages: [
+          {
+            role: "system",
+            content: "You are a careful assistant describing patterns in IMU-based movement data. You must not provide medical diagnoses or treatment recommendations."
+          },
+          { role: "user", content: userPrompt }
+        ],
+        temperature: 0.2,
+        max_tokens: 512
+      };
+
+      // 不带 Authorization，Content-Type 用 text/plain 降低 CORS 预检风险
+      const response = await fetch("http://127.0.0.1:1234/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain"
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error("HTTP " + response.status + ": " + text);
+      }
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content ?? "(no content)";
+      return content.trim();
+    }
+
+    // =======================
+    //    Web Bluetooth 部分
+    // =======================
+
+    // 与 MCU 中保持一致的 UUID
+    const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+    const UART_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+    let bleDevice = null;
+    let bleCharacteristic = null;
+    let bleBuffer = "";
+    const btTextDecoder = new TextDecoder();
 
     connectBtn.addEventListener("click", () => {
-      if (!("serial" in navigator)) {
-        alert("Web Serial API not supported in this browser.");
+      if (!navigator.bluetooth) {
+        alert("This browser does not support Web Bluetooth. Please use Chrome / Edge on desktop.");
         return;
       }
-      connectSerial();
+      if (!bleDevice) {
+        connectBLE();
+      } else {
+        disconnectBLE();
+      }
+    });
+
+    async function connectBLE() {
+      try {
+        statusText.textContent = "Requesting BLE device...";
+
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: "Tremor-STM32" }], // 和 MCU 广播名一致
+          optionalServices: [UART_SERVICE_UUID]
+        });
+
+        bleDevice = device;
+        bleDevice.addEventListener("gattserverdisconnected", onDisconnected);
+
+        statusText.textContent = "Connecting GATT...";
+        const server = await bleDevice.gatt.connect();
+
+        const service = await server.getPrimaryService(UART_SERVICE_UUID);
+        const characteristic = await service.getCharacteristic(UART_TX_CHAR_UUID);
+
+        bleCharacteristic = characteristic;
+
+        await bleCharacteristic.startNotifications();
+        bleCharacteristic.addEventListener(
+          "characteristicvaluechanged",
+          handleNotification
+        );
+
+        statusText.textContent = "BLE Connected";
+        connectBtn.textContent = "Disconnect BLE";
+      } catch (err) {
+        console.error(err);
+        statusText.textContent = "BLE Error: " + err;
+        bleDevice = null;
+        bleCharacteristic = null;
+        connectBtn.textContent = "Connect BLE";
+      }
+    }
+
+    function disconnectBLE() {
+      if (bleDevice && bleDevice.gatt.connected) {
+        bleDevice.gatt.disconnect();
+      }
+      // onDisconnected 会负责 UI 状态
+    }
+
+    function onDisconnected() {
+      statusText.textContent = "BLE Disconnected";
+      connectBtn.textContent = "Connect BLE";
+      bleDevice = null;
+      bleCharacteristic = null;
+      bleBuffer = "";
+    }
+
+    function handleNotification(event) {
+      const value = event.target.value;
+      const chunk = btTextDecoder.decode(value);
+
+      bleBuffer += chunk;
+      const lines = bleBuffer.split(/\r?\n/);
+      bleBuffer = lines.pop(); // 最后一行可能不完整
+
+      for (const line of lines) {
+        handleLine(line);
+      }
+    }
+
+    // 片段开始 / 结束
+    startSegBtn.addEventListener("click", () => {
+      if (!isRecordingSegment) {
+        isRecordingSegment = true;
+        currentSegment = [];
+        aiOutputEl.textContent = "(recording segment...)";
+        startSegBtn.disabled = true;
+        endSegBtn.disabled = false;
+      }
+    });
+
+    endSegBtn.addEventListener("click", () => {
+      if (isRecordingSegment) {
+        isRecordingSegment = false;
+        startSegBtn.disabled = false;
+        endSegBtn.disabled = true;
+
+        if (currentSegment.length === 0) {
+          aiOutputEl.textContent = "No data recorded in this segment.";
+          return;
+        }
+
+        aiOutputEl.textContent = "Analyzing segment with local LLM...";
+        analyzeSegmentWithLLM(currentSegment)
+          .then(text => {
+            aiOutputEl.textContent = text;
+          })
+          .catch(err => {
+            console.error(err);
+            aiOutputEl.textContent = "Error calling local LLM: " + err.message;
+          });
+      }
     });
   </script>
 </body>
